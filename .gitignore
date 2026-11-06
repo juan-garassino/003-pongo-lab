@@ -1,0 +1,13 @@
+# Generated artifacts, downloaded tools and pinned source checkouts
+build/
+.venv/
+__pycache__/
+*.pyc
+modules/*/build/
+
+# Build output inside the vendored Pongo tree
+src/pongoOS/build/
+
+# Large or separate upstream trees, pinned in notes/source-versions.md
+src/pongoOS/newlib/
+src/hoolock/

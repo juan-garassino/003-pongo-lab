@@ -1,0 +1,6 @@
+# Grant the local PongoOS development group access to PongoOS USB devices.
+# This does not match normal iPadOS, DFU, Recovery, or Pico devices.
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="05ac", ATTR{idProduct}=="4141", GROUP="plugdev", MODE="0660"
+
+# Grant the same group the serial shell of the iPad's Linux USB gadget.
+ACTION=="add|change", SUBSYSTEM=="tty", ATTRS{idVendor}=="1d6b", ATTRS{idProduct}=="0104", GROUP="plugdev", MODE="0660", ENV{ID_MM_DEVICE_IGNORE}="1"

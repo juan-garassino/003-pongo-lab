@@ -1,0 +1,108 @@
+diff --git a/gaster.c b/gaster.c
+index eeaa5b0..ea45099 100644
+--- a/gaster.c
++++ b/gaster.c
+@@ -1278,7 +1278,26 @@ checkm8_stage_patch(const usb_handle_t *handle) {
+ }
+ 
+ static bool
+-gaster_checkm8(usb_handle_t *handle) {
++gaster_a7_immediate_preflight(const usb_handle_t *handle) {
++	uint8_t response[16];
++	transfer_ret_t transfer_ret;
++	size_t i;
++
++	puts("Stage: A7 IMMEDIATE NO-WRITE PREFLIGHT");
++	if(send_usb_control_request(handle, 0xA1, 2, 0xFFFF, 0, response, sizeof(response), &transfer_ret) && transfer_ret.ret == USB_TRANSFER_OK && transfer_ret.sz == sizeof(response)) {
++		fputs("[+]immediate custom-request response:", stdout);
++		for(i = 0; i < sizeof(response); ++i) {
++			printf(" %02X", response[i]);
++		}
++		putchar('\n');
++		return true;
++	}
++	puts("[-]immediate custom-request preflight failed; stopping without USB reset");
++	return false;
++}
++
++static bool
++gaster_checkm8_internal(usb_handle_t *handle, bool a7_immediate_preflight) {
+ 	enum {
+ 		STAGE_RESET,
+ 		STAGE_SETUP,
+@@ -1290,6 +1309,11 @@ gaster_checkm8(usb_handle_t *handle) {
+ 
+ 	init_usb_handle(handle, APPLE_VID, DFU_MODE_PID);
+ 	while(stage != STAGE_PWNED && wait_usb_handle(handle, checkm8_check_usb_device, &pwned)) {
++		if(a7_immediate_preflight && cpid != 0x8960) {
++			puts("[-]immediate preflight requires CPID 0x8960");
++			close_usb_handle(handle);
++			return false;
++		}
+ 		if(!pwned) {
+ 			if(stage == STAGE_RESET) {
+ 				puts("Stage: RESET");
+@@ -1307,6 +1331,13 @@ gaster_checkm8(usb_handle_t *handle) {
+ 				puts("Stage: PATCH");
+ 				ret = checkm8_stage_patch(handle);
+ 				stage = STAGE_RESET;
++				if(a7_immediate_preflight) {
++					if(ret) {
++						ret = gaster_a7_immediate_preflight(handle);
++					}
++					close_usb_handle(handle);
++					return ret;
++				}
+ #ifdef HAVE_LIBUSB
+ 				if(cpid == 0x8960) {
+ 					puts("Unplug and replug the device now (at least 2 times)");
+@@ -1319,9 +1350,18 @@ gaster_checkm8(usb_handle_t *handle) {
+ 				puts("ret: false");
+ 				stage = STAGE_RESET;
+ 			}
++				if(!ret && a7_immediate_preflight) {
++					close_usb_handle(handle);
++					return false;
++				}
+ 			reset_usb_handle(handle);
+ 		} else {
+ 			stage = STAGE_PWNED;
++			if(a7_immediate_preflight) {
++				puts("[-]device is already marked PWND; a fresh DFU cycle is required for this diagnostic");
++				close_usb_handle(handle);
++				return false;
++			}
+ 			puts("Now you can boot untrusted images.");
+ 		}
+ 		close_usb_handle(handle);
+@@ -1329,6 +1369,11 @@ gaster_checkm8(usb_handle_t *handle) {
+ 	return stage == STAGE_PWNED;
+ }
+ 
++static bool
++gaster_checkm8(usb_handle_t *handle) {
++	return gaster_checkm8_internal(handle, false);
++}
++
+ static size_t
+ decompress_lzss(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len) {
+ 	const uint8_t *src_end = src + src_len, *dst_start = dst, *dst_end = dst + dst_len;
+@@ -1779,6 +1824,10 @@ main(int argc, char **argv) {
+ 		if(gaster_checkm8(&handle)) {
+ 			ret = 0;
+ 		}
++	} else if(argc == 2 && strcmp(argv[1], "a7-preflight") == 0) {
++		if(gaster_checkm8_internal(&handle, true)) {
++			ret = 0;
++		}
+ 	} else if(argc == 4 && strcmp(argv[1], "decrypt") == 0) {
+ 		if(gaster_decrypt_file(&handle, argv[2], argv[3])) {
+ 			ret = 0;
+@@ -1803,6 +1852,7 @@ main(int argc, char **argv) {
+ 		puts("options:");
+ 		puts("reset - Reset DFU state");
+ 		puts("pwn - Put the device in pwned DFU mode");
++		puts("a7-preflight - Patch fresh A7 DFU, read 16 custom-request bytes, and stop without reset");
+ 		puts("decrypt src dst - Decrypt file using GID0 AES key");
+ 		puts("decrypt_kbag kbag - Decrypt KBAG using GID0 AES key");
+ 		puts("readmem addr");

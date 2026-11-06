@@ -1,0 +1,63 @@
+diff --git a/src/kboot.c b/src/kboot.c
+index 28406511..4c784476 100644
+--- a/src/kboot.c
++++ b/src/kboot.c
+@@ -865,9 +865,27 @@ static int dt_set_bluetooth(void)
+     return 0;
+ }
+ 
++static bool dt_multitouch_cal_is_syscfg_reference(const u8 *data, u32 len)
++{
++    static const char prefix[] = "syscfg/";
++    u32 i;
++
++    if (len < sizeof(prefix) - 1)
++        return false;
++
++    for (i = 0; i < sizeof(prefix) - 1; i++) {
++        if (data[i] != prefix[i])
++            return false;
++    }
++
++    return true;
++}
++
+ static int dt_set_multitouch(void)
+ {
+     const char *path = fdt_get_alias(dt, "touchbar0");
++    if (path == NULL)
++        path = fdt_get_alias(dt, "touchscreen0");
+     if (path == NULL)
+         return 0;
+ 
+@@ -876,7 +894,9 @@ static int dt_set_multitouch(void)
+         bail("FDT: alias points at nonexistent node\n");
+ 
+     const char *adt_touchbar;
+-    if (fdt_node_check_compatible(dt, 0, "apple,j293") == 0)
++    if (fdt_node_check_compatible(dt, 0, "apple,j85") == 0)
++        adt_touchbar = "/arm-io/spi1/multi-touch";
++    else if (fdt_node_check_compatible(dt, 0, "apple,j293") == 0)
+         adt_touchbar = "/arm-io/spi0/multi-touch";
+     else if (fdt_node_check_compatible(dt, 0, "apple,j493") == 0)
+         adt_touchbar = "/arm-io/spi3/touch-bar";
+@@ -885,7 +905,7 @@ static int dt_set_multitouch(void)
+ 
+     int anode = adt_path_offset(adt, adt_touchbar);
+     if (anode < 0)
+-        bail("ADT: touchbar node %s not found\n", adt_touchbar);
++        bail("ADT: touch node %s not found\n", adt_touchbar);
+ 
+     u32 len;
+     const u8 *cal_blob = adt_getprop(adt, anode, "multi-touch-calibration", &len);
+@@ -893,6 +913,10 @@ static int dt_set_multitouch(void)
+         printf("ADT: Failed to get multi-touch-calibration from %s\n", adt_touchbar);
+         return 0;
+     }
++    if (dt_multitouch_cal_is_syscfg_reference(cal_blob, len)) {
++        printf("ADT: multitouch calibration is an unresolved SysCfg reference; omitting it\n");
++        return 0;
++    }
+ 
+     fdt_setprop(dt, node, "apple,z2-cal-blob", cal_blob, len);
+     return 0;

@@ -1,0 +1,320 @@
+#!/bin/sh
+# RAM-only init for the iPad mini 2. Mounts no block device and writes nothing
+# to storage. No `set -e`: PID 1 exiting would panic the kernel.
+# J85_ROOT, J85_MAX_PAGES and J85_UDC_WAIT exist only for initramfs/test_init.sh.
+BUILD_ID=@BUILD_ID@
+R=${J85_ROOT:-}
+MAX_PAGES=${J85_MAX_PAGES:-0}
+UDC_WAIT=${J85_UDC_WAIT:-30}
+
+if [ -z "$R" ]; then
+  /bin/busybox mount -t devtmpfs devtmpfs /dev
+  exec </dev/console >/dev/console 2>&1
+  /bin/busybox --install -s /bin
+  export PATH=/bin HOME=/ TERM=vt100
+  mount -t proc proc /proc
+  mount -t sysfs sysfs /sys
+  mount -t tmpfs tmpfs /tmp
+  mount -t configfs configfs /sys/kernel/config
+  mount -t debugfs debugfs /sys/kernel/debug
+  mkdir -p /dev/pts
+  mount -t devpts devpts /dev/pts
+fi
+
+T=$R/tmp
+G=$R/sys/kernel/config/usb_gadget/j85
+FB=$R/sys/class/graphics/fb0
+USB_IP=172.16.42.1
+
+udc=
+funcs=none
+bind_failed=
+verdict=STARTING
+shown_verdict=
+beat=0
+: > "$T/steps"
+: > "$T/usblog"
+: > "$T/keylast"
+
+step() { printf '%s\n' "$1" >> "$T/steps"; }
+
+# Print a line, clearing the rest of the row. Clearing the screen would wipe
+# the color bands, so the page is redrawn in place with a fixed row count.
+line() { printf '%.190s\033[K\n' "$1"; }
+
+# Print exactly $1 rows from file $2.
+section() {
+  awk -v n="$1" 'NR<=n { printf "%s\033[K\n", substr($0, 1, 190) }
+    END { for (i = NR; i < n; i++) printf "\033[K\n" }' "$2"
+}
+
+read_file() { cat "$1" 2>/dev/null | tr '\0' ' '; }
+
+collect_diag() {
+  {
+    echo "phy tunables: $(ls "$R/proc/device-tree/soc/bus@20c000000/phy@20c000020" 2>/dev/null | grep 'apple,cfg' | tr '\n' ' ')"
+    for d in apple-usb-complex phy-apple-ausb dwc2; do
+      echo "driver $d: $(ls "$R/sys/bus/platform/drivers/$d" 2>/dev/null | grep -vE '^(bind|unbind|uevent|module)$' | tr '\n' ' ')"
+    done
+    echo "udc list: $(ls "$R/sys/class/udc" 2>/dev/null | tr '\n' ' ')"
+    echo "deferred: $(read_file "$R/sys/kernel/debug/devices_deferred" | tr '\n' ' ')"
+    echo "fb format: $(read_file "$R"/proc/device-tree/chosen/framebuffer*/format)"
+    echo "input: $(grep '^N:' "$R/proc/bus/input/devices" 2>/dev/null | cut -d= -f2 | tr '\n' ' ')"
+  } > "$T/diag"
+}
+
+start_fullscreen_touch_test() {
+  # On the real device, replace the diagnostic console with a fullscreen
+  # touch canvas after USB setup. The USB shell remains active in the background.
+  if [ -z "$R" ] && [ -x /bin/touch-test ]; then
+    step "ok fullscreen touch test"
+    /bin/touch-test
+    step "fullscreen touch test exited"
+  fi
+}
+
+# Grow file $1 to exactly $2 bytes by repeating its contents.
+repeat_to() {
+  while [ "$(wc -c < "$1")" -lt "$2" ]; do
+    cat "$1" "$1" > "$1.next"
+    mv "$1.next" "$1"
+  done
+  head -c "$2" "$1" > "$1.next"
+  mv "$1.next" "$1"
+}
+
+fb_ready() {
+  [ -r "$FB/stride" ] && [ -r "$FB/virtual_size" ] || return 1
+  stride=$(cat "$FB/stride")
+  size=$(cat "$FB/virtual_size")
+  height=${size#*,}
+  [ "${stride:-0}" -gt 0 ] && [ "${height:-0}" -gt 0 ]
+}
+
+# Userspace sees XRGB8888 in memory, so a pixel is B G R X.
+draw_verdict_band() {
+  fb_ready || return
+  case $verdict in
+    CONNECTED) pixel='\000\377\000\000' ;;
+    NO-UDC|BIND-FAILED) pixel='\000\000\377\000' ;;
+    *) pixel='\000\377\377\000' ;;
+  esac
+  printf "$pixel" > "$T/band"
+  repeat_to "$T/band" $((stride * height / 8))
+  dd if="$T/band" of="$R/dev/fb0" bs="$stride" seek=$((height * 6 / 10)) conv=notrunc 2>/dev/null
+  rm -f "$T/band"
+}
+
+# Moving noise proves userspace can draw, and shows the system is alive.
+draw_noise() {
+  fb_ready || return
+  dd if=/dev/urandom of="$R/dev/fb0" bs="$stride" count=$((height / 20)) \
+    seek=$((height * 8 / 10)) conv=notrunc 2>/dev/null
+}
+
+key_name() {
+  case $1 in
+    172) echo HOME ;;
+    116) echo POWER ;;
+    115) echo VOL+ ;;
+    114) echo VOL- ;;
+    113) echo MUTE ;;
+    *) echo "code$1" ;;
+  esac
+}
+
+# Read one fd so no events are lost between reads. A 64-bit input_event is
+# 24 bytes: 16 of time, then u16 type, u16 code, s32 value.
+key_watch() {
+  dev=$1
+  ev=$T/keyev.${dev##*/}
+  count=0
+  while dd bs=24 count=1 of="$ev" <&3 2>/dev/null && [ -s "$ev" ]; do
+    set -- $(hexdump -s 16 -n 8 -e '2/2 "%u " 1/4 " %d\n"' "$ev")
+    [ "${1:-0}" = 1 ] || continue
+    count=$((count + 1))
+    echo "$count $(key_name "$2") $3" > "$T/keylast"
+  done 3<"$dev"
+}
+
+start_key_watchers() {
+  for dev in "$R"/dev/input/event*; do
+    [ -e "$dev" ] && key_watch "$dev" &
+  done
+}
+
+shell_loop() {
+  while :; do
+    if [ ! -c /dev/ttyGS0 ]; then
+      sleep 1
+      continue
+    fi
+    # Wait until the host opens the port and sends a line. Starting the shell
+    # earlier feeds its prompt into the host tty's echo.
+    echo " " > /dev/ttyGS0
+    read -r _ < /dev/ttyGS0
+    PS1='j85# ' setsid -c sh -i </dev/ttyGS0 >/dev/ttyGS0 2>&1 ||
+      PS1='j85# ' setsid sh -i </dev/ttyGS0 >/dev/ttyGS0 2>&1
+    sleep 1
+  done
+}
+
+write_attr() {
+  if ! echo "$2" > "$1" 2>/dev/null; then
+    step "FAILED write $1"
+    return 1
+  fi
+}
+
+add_function() {
+  if mkdir -p "$G/functions/$1" 2>/dev/null &&
+     ln -s "$G/functions/$1" "$G/configs/c.1/$1" 2>/dev/null; then
+    step "ok function $1"
+  else
+    step "FAILED function $1"
+    return 1
+  fi
+}
+
+remove_function() {
+  rm -f "$G/configs/c.1/$1" 2>/dev/null
+  rmdir "$G/functions/$1" 2>/dev/null
+}
+
+gadget_prepare() {
+  mkdir -p "$G" "$G/strings/0x409" "$G/configs/c.1/strings/0x409" 2>/dev/null || {
+    step "FAILED mkdir gadget"
+    return 1
+  }
+  write_attr "$G/idVendor" 0x1d6b
+  write_attr "$G/idProduct" 0x0104
+  write_attr "$G/strings/0x409/manufacturer" "hello-juan"
+  write_attr "$G/strings/0x409/product" "iPad mini 2 Linux"
+  write_attr "$G/strings/0x409/serialnumber" "$BUILD_ID"
+  write_attr "$G/configs/c.1/strings/0x409/configuration" "shell"
+  write_attr "$G/configs/c.1/MaxPower" 500
+  step "ok gadget prepared"
+}
+
+gadget_bind() {
+  if echo "$udc" > "$G/UDC" 2>/dev/null &&
+     [ "$(cat "$G/UDC" 2>/dev/null)" = "$udc" ]; then
+    step "ok UDC bound ($funcs)"
+    return 0
+  fi
+  step "FAILED UDC bind ($funcs)"
+  return 1
+}
+
+setup_usb() {
+  gadget_prepare || { bind_failed=1; return; }
+  add_function acm.usb0 || { bind_failed=1; return; }
+  funcs=acm
+  add_function ncm.usb0 && funcs=acm+ncm
+  gadget_bind && return
+
+  # Endpoints may run out, so the serial shell is worth more than networking.
+  echo "" > "$G/UDC" 2>/dev/null
+  remove_function ncm.usb0
+  funcs=acm
+  gadget_bind || bind_failed=1
+}
+
+setup_network() {
+  ifname=$(cat "$G/functions/ncm.usb0/ifname" 2>/dev/null)
+  [ -n "$ifname" ] || return
+  if ifconfig "$ifname" "$USB_IP" netmask 255.255.255.0 up 2>/dev/null; then
+    step "ok $ifname $USB_IP"
+  else
+    step "FAILED ifconfig $ifname"
+  fi
+}
+
+update_usb_status() {
+  state=$(read_file "$R/sys/class/udc/$udc/state")
+  speed=$(read_file "$R/sys/class/udc/$udc/current_speed")
+  if [ -n "$bind_failed" ]; then
+    verdict=BIND-FAILED
+  elif [ -z "$udc" ]; then
+    [ "$1" = final ] && verdict=NO-UDC || verdict=WAIT-UDC
+  elif [ "$state" = configured ]; then
+    verdict=CONNECTED
+  else
+    verdict=WAIT-HOST
+  fi
+  dmesg 2>/dev/null | grep -iE 'dwc2|gadget|udc|usb|phy|LUN' | tail -24 > "$T/usblog"
+}
+
+draw_page() {
+  printf '\033[H'
+  line "hello-juan build $BUILD_ID  beat $beat  up $(cut -d' ' -f1 "$R/proc/uptime" 2>/dev/null)s  green=connected yellow=waiting red=failed"
+  line "Linux $(uname -r) on $(read_file "$R/proc/device-tree/model")"
+  line "RAM-only initramfs, no storage mounted"
+  line "cmdline: $(read_file "$R/proc/cmdline")"
+  line ""
+  line "USB: $verdict  udc=${udc:-none}  state=${state:-none}  speed=${speed:-none}  functions=$funcs"
+  line "shell: $([ -c "$R/dev/ttyGS0" ] && echo ttyGS0-present || echo ttyGS0-absent)  net: ${ifname:-none} $USB_IP"
+  line "keys: count/name/value = $(cat "$T/keylast")   (press each button)"
+  line "fb: size=$(read_file "$FB/virtual_size") stride=$(read_file "$FB/stride") bpp=$(read_file "$FB/bits_per_pixel")"
+  line "mem: $(grep -E 'MemAvailable' "$R/proc/meminfo" 2>/dev/null)"
+  line ""
+  line "-- steps --"
+  section 12 "$T/steps"
+  line "-- diagnostics --"
+  section 9 "$T/diag"
+  line "-- kernel usb log --"
+  section 24 "$T/usblog"
+}
+
+refresh() {
+  update_usb_status "$1"
+  draw_page
+  if [ "$verdict" != "$shown_verdict" ]; then
+    draw_verdict_band
+    shown_verdict=$verdict
+  fi
+  draw_noise
+}
+
+printf '\033[2J\033[H\033[?25l'
+
+# ignore_loglevel would keep kernel text scrolling over the page.
+if [ -z "$R" ]; then
+  echo N > /sys/module/printk/parameters/ignore_loglevel
+  dmesg -n 1
+fi
+step "ok console quiet"
+
+collect_diag
+start_key_watchers
+
+i=0
+while [ "$i" -lt "$UDC_WAIT" ]; do
+  udc=$(ls "$R/sys/class/udc" 2>/dev/null | head -n 1)
+  [ -n "$udc" ] && break
+  refresh waiting
+  sleep 1
+  i=$((i + 1))
+done
+
+if [ -n "$udc" ]; then
+  step "ok found UDC $udc after ${i}s"
+  setup_usb
+  [ -n "$bind_failed" ] || setup_network
+else
+  step "FAILED no UDC after ${UDC_WAIT}s"
+fi
+collect_diag
+
+shell_loop &
+start_fullscreen_touch_test
+
+while :; do
+  beat=$((beat + 1))
+  refresh final
+  if [ "$MAX_PAGES" -gt 0 ] && [ "$beat" -ge "$MAX_PAGES" ]; then
+    kill $(jobs -p) 2>/dev/null
+    exit 0
+  fi
+  sleep 2
+done

@@ -1,0 +1,380 @@
+diff --git a/arch/arm64/boot/dts/apple/s5l8960x-mini2.dtsi b/arch/arm64/boot/dts/apple/s5l8960x-mini2.dtsi
+index c7a95fc01..ea0e53f6c 100644
+--- a/arch/arm64/boot/dts/apple/s5l8960x-mini2.dtsi
++++ b/arch/arm64/boot/dts/apple/s5l8960x-mini2.dtsi
+@@ -14,6 +14,10 @@
+ / {
+ 	chassis-type = "tablet";
+ 
++	aliases {
++		touchscreen0 = &touchscreen;
++	};
++
+ 	gpio-keys {
+ 		compatible = "gpio-keys";
+ 
+@@ -55,6 +59,24 @@ &framebuffer0 {
+ 	power-domains = <&ps_disp0 &ps_dp>;
+ };
+ 
++&spi1 {
++	cs-gpios = <&pinctrl 71 GPIO_ACTIVE_LOW>;
++	spi-cs-setup-delay-ns = <1000000>;
++	spi-cs-hold-delay-ns = <1000000>;
++	status = "okay";
++
++	touchscreen: touchscreen@0 {
++		compatible = "apple,j85-multitouch";
++		reg = <0>;
++		spi-max-frequency = <5000000>;
++		reset-gpios = <&pinctrl 23 GPIO_ACTIVE_LOW>;
++		interrupts-extended = <&pinctrl 15 IRQ_TYPE_EDGE_FALLING>;
++		firmware-name = "apple/j85-multitouch.bin";
++		touchscreen-size-x = <1536>;
++		touchscreen-size-y = <2048>;
++	};
++};
++
+ &i2c0 {
+ 	status = "okay";
+ 
+diff --git a/arch/arm64/boot/dts/apple/s5l8960x.dtsi b/arch/arm64/boot/dts/apple/s5l8960x.dtsi
+index 2a747bec0..e24a1fd1d 100644
+--- a/arch/arm64/boot/dts/apple/s5l8960x.dtsi
++++ b/arch/arm64/boot/dts/apple/s5l8960x.dtsi
+@@ -132,6 +132,18 @@ i2c2: i2c@20a112000 {
+ 			status = "disabled";
+ 		};
+ 
++		spi1: spi@20a084000 {
++			compatible = "apple,s5l8960x-spi", "apple,spi";
++			reg = <0x2 0x0a084000 0x0 0x4000>;
++			interrupt-parent = <&aic>;
++			interrupts = <AIC_IRQ 137 IRQ_TYPE_LEVEL_HIGH>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			clocks = <&clkref>;
++			power-domains = <&ps_spi1>;
++			status = "disabled";
++		};
++
+ 		i2c3: i2c@20a113000 {
+ 			compatible = "apple,s5l8960x-i2c", "apple,i2c";
+ 			reg = <0x2 0x0a113000 0x0 0x1000>;
+diff --git a/drivers/input/touchscreen/apple_z2.c b/drivers/input/touchscreen/apple_z2.c
+index 271ababf0..c61ad5fda 100644
+--- a/drivers/input/touchscreen/apple_z2.c
++++ b/drivers/input/touchscreen/apple_z2.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <linux/delay.h>
++#include <linux/atomic.h>
+ #include <linux/firmware.h>
+ #include <linux/input.h>
+ #include <linux/input/mt.h>
+@@ -35,6 +36,8 @@ struct apple_z2 {
+ 	struct input_dev *input_dev;
+ 	struct completion boot_irq;
+ 	bool booted;
++	bool gen1;
++	atomic_t irq_count;
+ 	int index_parity;
+ 	struct touchscreen_properties props;
+ 	const char *fw_name;
+@@ -161,6 +164,7 @@ static irqreturn_t apple_z2_irq(int irq, void *data)
+ {
+ 	struct apple_z2 *z2 = data;
+ 
++	atomic_inc(&z2->irq_count);
+ 	if (unlikely(!z2->booted))
+ 		complete(&z2->boot_irq);
+ 	else
+@@ -253,6 +257,182 @@ static int apple_z2_send_firmware_blob(struct apple_z2 *z2, const u8 *data,
+ 	return 0;
+ }
+ 
++static int apple_z2_send_raw(struct apple_z2 *z2, const u8 *data, size_t size,
++			     u8 bits_per_word, bool send_ack)
++{
++	struct spi_message msg;
++	struct spi_transfer xfer[2] = {};
++
++	spi_message_init(&msg);
++	xfer[0].tx_buf = data;
++	xfer[0].len = size;
++	xfer[0].bits_per_word = bits_per_word;
++	spi_message_add_tail(&xfer[0], &msg);
++
++	z2->tx_buf[0] = 0x1a;
++	z2->tx_buf[1] = 0xa1;
++	if (send_ack) {
++		xfer[1].tx_buf = z2->tx_buf;
++		xfer[1].len = 2;
++		xfer[1].bits_per_word = bits_per_word;
++		spi_message_add_tail(&xfer[1], &msg);
++	}
++
++	return spi_sync(z2->spidev, &msg);
++}
++
++static const u8 *apple_z2_build_hbpp_blob(u32 address, const u8 *data,
++					  size_t data_size, size_t *size)
++{
++	size_t padded = round_up(data_size, 4);
++	size_t blob_size = sizeof(struct apple_z2_hbpp_blob_hdr) + padded + sizeof(u32);
++	u8 *blob __free(kfree) = kzalloc(blob_size, GFP_KERNEL);
++	struct apple_z2_hbpp_blob_hdr *hdr = (void *)blob;
++	u32 checksum = 0;
++	u16 header_checksum = 0;
++	size_t i;
++
++	if (!blob)
++		return ERR_PTR(-ENOMEM);
++
++	hdr->cmd = cpu_to_le16(APPLE_Z2_HBPP_CMD_BLOB);
++	hdr->len = cpu_to_le16(padded / 4);
++	hdr->addr = cpu_to_le32(address);
++	memcpy(blob + sizeof(*hdr), data, data_size);
++
++	for (i = 2; i < 8; i++)
++		header_checksum += blob[i];
++	hdr->checksum = cpu_to_le16(header_checksum);
++
++	for (i = 0; i < data_size; i++)
++		checksum += data[i];
++	put_unaligned_le32(checksum, blob + sizeof(*hdr) + padded);
++
++	*size = blob_size;
++	return no_free_ptr(blob);
++}
++
++static int apple_z2_upload_gen1(struct apple_z2 *z2, const u8 *firmware,
++				size_t firmware_size)
++{
++	static const u8 intro[] = {0x19, 0xc1};
++	static const u8 handshake[] = {
++		0x1a, 0xa1, 0x18, 0xe1, 0x18, 0xe1, 0x18, 0xe1,
++		0x18, 0xe1, 0x18, 0xe1, 0x18, 0xe1, 0x18, 0xe1,
++	};
++	static const struct {
++		u32 address;
++		u32 value;
++	} registers[] = {
++		{0x10003060, 6099},
++		{0x1000305c, 2},
++		{0x10003058, 6},
++		{0x10003000, 3},
++		{0x10003518, 1},
++	};
++	static const u8 request_calibration[] = {0x1f, 0x01};
++	static const u8 boot[] = {
++		0x1d, 0x53, 0x34, 0x00, 0x10, 0x00,
++		0x00, 0x01, 0x00, 0x00, 0x00, 0x45,
++	};
++	size_t ignored;
++	size_t i;
++	int error;
++
++	error = apple_z2_send_raw(z2, intro, sizeof(intro), 8, false);
++	if (error)
++		return error;
++
++	for (i = 0; i < 3; i++) {
++		error = apple_z2_send_raw(z2, handshake, sizeof(handshake), 8, false);
++		if (error)
++			return error;
++	}
++
++	if (device_property_present(&z2->spidev->dev, CAL_PROP_NAME)) {
++		const u8 *cal __free(kfree) =
++			apple_z2_build_cal_blob(z2, 0x10009000, &ignored);
++		if (IS_ERR(cal))
++			return PTR_ERR(cal);
++		if (cal) {
++			error = apple_z2_send_raw(z2, cal, ignored, 16, true);
++			if (error)
++				return error;
++		}
++	} else {
++		dev_warn(&z2->spidev->dev, "J85 calibration data is absent\n");
++	}
++
++	error = apple_z2_send_raw(z2, firmware, firmware_size, 16, true);
++	if (error)
++		return error;
++
++	for (i = 0; i < ARRAY_SIZE(registers); i++) {
++		u8 value[4] __aligned(4);
++		const u8 *packet __free(kfree);
++
++		put_unaligned_le32(registers[i].value, value);
++		packet = apple_z2_build_hbpp_blob(registers[i].address, value,
++						   sizeof(value), &ignored);
++		if (IS_ERR(packet))
++			return PTR_ERR(packet);
++
++		error = apple_z2_send_raw(z2, packet, ignored, 16, true);
++		if (error)
++			return error;
++	}
++
++	error = apple_z2_send_raw(z2, request_calibration,
++				  sizeof(request_calibration), 16, true);
++	if (error)
++		return error;
++
++	return apple_z2_send_raw(z2, boot, sizeof(boot), 16, false);
++}
++
++static bool apple_z2_is_gen1(struct spi_device *spi)
++{
++	const struct spi_device_id *id = spi_get_device_id(spi);
++
++	return id && !strcmp(id->name, "j85-multitouch");
++}
++
++static void apple_z2_gen1_reset_pulse(struct apple_z2 *z2, const char *stage)
++{
++	/* GPIO descriptors are polarity-aware: 1 asserts the active-low reset. */
++	gpiod_set_value(z2->reset_gpio, 1);
++	usleep_range(1000, 2000);
++	gpiod_set_value(z2->reset_gpio, 0);
++	usleep_range(1000, 2000);
++	dev_dbg(&z2->spidev->dev, "%s: reset pulse complete\n", stage);
++}
++
++static int apple_z2_gen1_zero_exchange(struct apple_z2 *z2, const char *stage)
++{
++	struct spi_transfer xfer = {};
++	int error;
++
++	memset(z2->tx_buf, 0, 4);
++	memset(z2->rx_buf, 0, 4);
++	xfer.tx_buf = z2->tx_buf;
++	xfer.rx_buf = z2->rx_buf;
++	xfer.len = 4;
++
++	error = spi_sync_transfer(z2->spidev, &xfer, 1);
++	if (error) {
++		dev_err(&z2->spidev->dev,
++			"%s: four-byte zero exchange failed: %d\n", stage, error);
++		return error;
++	}
++
++	usleep_range(1000, 2000);
++	dev_info(&z2->spidev->dev,
++		 "%s: zero exchange rx=%02x %02x %02x %02x\n",
++		 stage, z2->rx_buf[0], z2->rx_buf[1],
++		 z2->rx_buf[2], z2->rx_buf[3]);
++	return 0;
++}
++
+ static int apple_z2_upload_firmware(struct apple_z2 *z2)
+ {
+ 	const struct apple_z2_fw_hdr *fw_hdr;
+@@ -270,8 +450,18 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
+ 		return error;
+ 	}
+ 
++	if (fw->size < sizeof(struct apple_z2_fw_hdr)) {
++		dev_err(&z2->spidev->dev, "firmware is too short\n");
++		return -EINVAL;
++	}
++
+ 	fw_hdr = (const struct apple_z2_fw_hdr *)fw->data;
+-	if (le32_to_cpu(fw_hdr->magic) != APPLE_Z2_FW_MAGIC || le32_to_cpu(fw_hdr->version) != 1) {
++	if (le32_to_cpu(fw_hdr->magic) != APPLE_Z2_FW_MAGIC ||
++	    le32_to_cpu(fw_hdr->version) != 1) {
++		if (!strcmp(spi_get_device_id(z2->spidev)->name,
++			    "j85-multitouch"))
++			return apple_z2_upload_gen1(z2, fw->data, fw->size);
++
+ 		dev_err(&z2->spidev->dev, "invalid firmware header\n");
+ 		return -EINVAL;
+ 	}
+@@ -331,13 +521,44 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
+ 
+ static int apple_z2_boot(struct apple_z2 *z2)
+ {
++	unsigned int boot_irq_timeout_ms = 20;
+ 	int error;
+ 
+-	reinit_completion(&z2->boot_irq);
+-	enable_irq(z2->spidev->irq);
+-	gpiod_set_value(z2->reset_gpio, 0);
+-	if (!wait_for_completion_timeout(&z2->boot_irq, msecs_to_jiffies(20)))
+-		return -ETIMEDOUT;
++	if (z2->gen1) {
++		boot_irq_timeout_ms = 500;
++
++		dev_info(&z2->spidev->dev, "Gen-1 bring-up: first reset\n");
++		enable_irq(z2->spidev->irq);
++		reinit_completion(&z2->boot_irq);
++		apple_z2_gen1_reset_pulse(z2, "Gen-1 bring-up first reset");
++
++		error = apple_z2_gen1_zero_exchange(z2, "Gen-1 bring-up first zero");
++		if (error)
++			return error;
++
++		dev_info(&z2->spidev->dev, "Gen-1 bring-up: second reset\n");
++		reinit_completion(&z2->boot_irq);
++		apple_z2_gen1_reset_pulse(z2, "Gen-1 bring-up second reset");
++		if (!wait_for_completion_timeout(&z2->boot_irq,
++						 msecs_to_jiffies(boot_irq_timeout_ms))) {
++			dev_err(&z2->spidev->dev,
++				"Gen-1 boot IRQ timeout after %u ms (irq_count=%d)\n",
++				boot_irq_timeout_ms, atomic_read(&z2->irq_count));
++			disable_irq(z2->spidev->irq);
++			return -ETIMEDOUT;
++		}
++
++		dev_info(&z2->spidev->dev,
++			 "Gen-1 boot IRQ observed (irq_count=%d); loading firmware\n",
++			 atomic_read(&z2->irq_count));
++	} else {
++		reinit_completion(&z2->boot_irq);
++		enable_irq(z2->spidev->irq);
++		gpiod_set_value(z2->reset_gpio, 0);
++		if (!wait_for_completion_timeout(&z2->boot_irq,
++						 msecs_to_jiffies(boot_irq_timeout_ms)))
++			return -ETIMEDOUT;
++	}
+ 
+ 	error = apple_z2_upload_firmware(z2);
+ 	if (error) {
+@@ -369,6 +590,8 @@ static int apple_z2_probe(struct spi_device *spi)
+ 
+ 	z2->spidev = spi;
+ 	init_completion(&z2->boot_irq);
++	atomic_set(&z2->irq_count, 0);
++	z2->gen1 = apple_z2_is_gen1(spi);
+ 	spi_set_drvdata(spi, z2);
+ 
+ 	/* Reset the device on boot */
+@@ -416,6 +639,9 @@ static int apple_z2_probe(struct spi_device *spi)
+ 
+ 	/* Wait for device reset to finish */
+ 	usleep_range(5000, 10000);
++	if (z2->gen1)
++		dev_info(dev, "Gen-1 diagnostic path selected for %s\n",
++			 spi_get_device_id(spi)->name);
+ 	error = apple_z2_boot(z2);
+ 	if (error)
+ 		return error;
+@@ -449,6 +675,7 @@ static int apple_z2_resume(struct device *dev)
+ static DEFINE_SIMPLE_DEV_PM_OPS(apple_z2_pm, apple_z2_suspend, apple_z2_resume);
+ 
+ static const struct of_device_id apple_z2_of_match[] = {
++	{ .compatible = "apple,j85-multitouch" },
+ 	{ .compatible = "apple,j293-touchbar" },
+ 	{ .compatible = "apple,j493-touchbar" },
+ 	{}
+@@ -456,6 +683,7 @@ static const struct of_device_id apple_z2_of_match[] = {
+ MODULE_DEVICE_TABLE(of, apple_z2_of_match);
+ 
+ static struct spi_device_id apple_z2_of_id[] = {
++	{ .name = "j85-multitouch", .driver_data = (kernel_ulong_t)"iPad mini 2 Touchscreen" },
+ 	{ .name = "j293-touchbar", .driver_data = (kernel_ulong_t)"MacBookPro17,1 Touch Bar" },
+ 	{ .name = "j493-touchbar", .driver_data = (kernel_ulong_t)"Mac14,7 Touch Bar" },
+ 	{}

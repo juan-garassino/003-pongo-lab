@@ -1,0 +1,63 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Juan's Screen Share</title><style>
+body{margin:0;background:#111827;color:#edf2f7;font:18px Arial,sans-serif}main{max-width:1050px;margin:auto;padding:24px}h1{font-size:28px}button{background:#38bdf8;color:#082f49;border:0;border-radius:8px;padding:14px 22px;font-size:18px;margin:8px 8px 8px 0;cursor:pointer}video{width:100%;max-height:75vh;background:#000;border-radius:10px}p{line-height:1.5}a{color:#7dd3fc;overflow-wrap:anywhere}#status{color:#b9d4e7}#details{font-size:14px;color:#9ca3af}
+</style></head><body><main><h1>Juan's Screen Share</h1><p id="instructions"></p><p id="pair"></p><button id="start">Choose a window to share</button><button id="stop" hidden>Stop sharing</button><button id="play" hidden>Show screen</button><p id="status">Starting…</p><video id="video" autoplay playsinline muted controls></video><p id="details">Local Wi-Fi · One iPad · Screen only, no audio</p></main><script>
+(function(){
+'use strict';
+var role='__ROLE__', key='__KEY__', sender=role==='sender';
+var pc=null, stream=null, waitingIce=[], ready=false, cursor=0, active=false;
+var video=document.getElementById('video'), status=document.getElementById('status');
+var start=document.getElementById('start'), stop=document.getElementById('stop'), play=document.getElementById('play');
+var base='/api/', params='?role='+role+'&key='+encodeURIComponent(key);
+function say(s){status.textContent=s;}
+function send(data){return fetch(base+'send'+params,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}).then(function(r){if(!r.ok)throw Error('Connection to laptop failed');});}
+function fail(e){say(e.message || String(e));}
+function peer(){
+ if(pc)pc.close();
+ pc=new RTCPeerConnection({iceServers:[]});
+ pc.onicecandidate=function(e){if(e.candidate)send({type:'ice',candidate:e.candidate.toJSON ? e.candidate.toJSON() : e.candidate}).catch(fail);};
+ pc.oniceconnectionstatechange=function(){var s=pc.iceConnectionState;say(s==='connected'||s==='completed'?'Connected — sharing live':s==='failed'?'Connection failed. Check that both devices use the same Wi-Fi.':'Connection: '+s);};
+ pc.ontrack=function(e){video.srcObject=e.streams[0];video.play().catch(function(){play.hidden=false;say('Tap Show screen to begin.');});};
+ return pc;
+}
+async function flush(){while(waitingIce.length)await pc.addIceCandidate(waitingIce.shift());}
+async function offer(){
+ if(!stream||!ready)return;
+ peer();waitingIce=[];
+ stream.getTracks().forEach(function(t){pc.addTrack(t,stream);});
+ if(pc.getTransceivers && window.RTCRtpSender && RTCRtpSender.getCapabilities){
+  var codecs=RTCRtpSender.getCapabilities('video').codecs.filter(function(c){return c.mimeType.toLowerCase()==='video/h264';});
+  pc.getTransceivers().forEach(function(t){if(t.setCodecPreferences && codecs.length)t.setCodecPreferences(codecs);});
+ }
+ await pc.setLocalDescription(await pc.createOffer());
+ await send({type:'offer',sdp:pc.localDescription});say('Connecting to iPad…');
+}
+async function handle(m){
+ if(m.type==='ready'&&sender){ready=true;await offer();if(!stream)say('iPad connected. Choose a window to share.');}
+ if(m.type==='offer'&&!sender){peer();await pc.setRemoteDescription(m.sdp);await flush();await pc.setLocalDescription(await pc.createAnswer());await send({type:'answer',sdp:pc.localDescription});}
+ if(m.type==='answer'&&sender&&pc){await pc.setRemoteDescription(m.sdp);await flush();}
+ if(m.type==='ice'){if(pc&&pc.remoteDescription)await pc.addIceCandidate(m.candidate);else waitingIce.push(m.candidate);}
+ if(m.type==='stop'){if(pc)pc.close();video.srcObject=null;say('Sharing stopped on the laptop.');}
+}
+async function poll(){
+ try{var r=await fetch(base+'poll'+params+'&after='+cursor,{cache:'no-store'});if(!r.ok)throw Error('Pairing expired. Reopen the current laptop link.');var list=await r.json();for(var i=0;i<list.length;i++){cursor=list[i].id;await handle(list[i].data);}}
+ catch(e){fail(e);}
+ setTimeout(poll,500);
+}
+function end(){if(!active)return;active=false;if(stream)stream.getTracks().forEach(function(t){t.stop();});stream=null;if(pc)pc.close();video.srcObject=null;start.hidden=false;stop.hidden=true;send({type:'stop'}).catch(fail);say('Sharing stopped.');}
+start.onclick=async function(){
+ try{
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getDisplayMedia)throw Error('Open http://localhost:8765/sender in laptop Chrome.');
+  stream=await navigator.mediaDevices.getDisplayMedia({video:{width:{ideal:1280},height:{ideal:720},frameRate:{ideal:20,max:25}},audio:false});
+  active=true;start.hidden=true;stop.hidden=false;
+  stream.getVideoTracks()[0].onended=end;
+  say('Sharing selected. Open the pairing link on the iPad.');await offer();
+ }catch(e){fail(e);}
+};
+stop.onclick=end;play.onclick=function(){video.play().then(function(){play.hidden=true;}).catch(fail);};
+start.hidden=!sender;video.hidden=sender;
+document.getElementById('instructions').textContent=sender?'Choose a window, then open this private pairing link in iPad Safari:':'This iPad will display the window selected on your laptop.';
+if(sender){var a=document.createElement('a');a.href='http://192.168.0.214:8765/?key='+key;a.textContent=a.href;var qr=document.createElement('img');qr.src='/qr.png';qr.alt='Scan to connect the iPad';qr.width=246;qr.height=246;qr.style.display='block';qr.style.marginBottom='12px';document.getElementById('pair').appendChild(qr);document.getElementById('pair').appendChild(a);say('Ready. Choose a window to share.');}
+if(!window.RTCPeerConnection){say('This Safari version does not expose the required screen-streaming support.');return;}
+poll();if(!sender){say('Waiting for the laptop to share a window…');send({type:'ready'}).catch(fail);}
+})();
+</script></body></html>

@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  no-hardware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install local test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y busybox
+      - name: Validate shell and Python
+        run: |
+          bash -n scripts/*.sh
+          python3 -m py_compile scripts/*.py simulator/*.py
+      - name: Run no-device tests
+        run: |
+          bash initramfs/test_init.sh
+          bash scripts/test_j85_sh.sh
+          bash scripts/test-linux-apps.sh
+          bash scripts/test-native-ipad.sh
